@@ -1,70 +1,61 @@
 #!/usr/bin/env python3
-"""
-CARNAGE SENTINEL — hidden-process hunter for Windows.
+"""CARNAGE SENTINEL v1.1 — hidden-process, window and connection hunter.
 
-Tracks backgrounded PowerShell, cmd, python, WSL, and node processes:
-  * identity     (pid, ppid, name, cmdline, owner, start time)
-  * CPU / RAM    (live sample deltas, not lifetime averages)
-  * network      (TCP connections per pid, remote IP/port/state)
-  * hierarchy    (parent chain so a stray shell traces to its master)
-  * window state (visible / hidden / suppressed)
+New in v1.1 over v1.0:
+  * session-aware enumeration (Sessions 0/1 exposed as a column, cross-session flagged)
+  * 8-state window classifier instead of VISIBLE/SUPPRESSED (NO-WINDOW, HIDDEN,
+    HIDDEN-UNTITLED, VISIBLE-UNTITLED, ...) with window class capture
+  * heuristic threat score 0-100 with printed reasons
+  * command-line pattern detection (encoded payloads, policy bypass, reverse shells,
+    persistence, credential access)
+  * per-process CPU from a real delta table, not a stub
+  * structured JSONL event log + filterable list-viewer with timestamps and pids
+  * connection-diff events: fires once when a socket appears, not every sweep
 
-Tabs:
-  HUNT      — live table, click a row to see cmdline + connections
-  NETWORK   — every connection with owning process
-  TREE      — parent/child chains
-  LOG       — appends notable events to logs/sentinel.log
-
-Kill button: hard-kills the selected PID. No confirmation theatre.
+Tabs: HUNT · NETWORK · TREE · LOG · DETAIL
 """
 from __future__ import annotations
 
-import ctypes
-import ctypes.wintypes as wt
 import json
 import os
-import subprocess
 import sys
 import threading
 import time
+import tkinter as tk
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
+from tkinter import ttk, filedialog
 
-try:
-    import psutil
-except ImportError:
-    sys.exit("psutil missing: pip install psutil")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import tkinter as tk
-from tkinter import ttk, messagebox
+import carnage_detect as detect
+import carnage_log as clog
 
-# ── Carnage palette (matches DeepSeek-Meter.ps1 house style) ────────────────
-BG        = "#0f0f23"
-BG_ALT    = "#16162e"
-BG_SEL    = "#2a0a12"
-FG        = "#00ff88"
-FG_DIM    = "#4a7a63"
-FG_WARN   = "#ffb000"
-FG_CRIT   = "#ff2b4a"
-FG_BLOOD  = "#c40d2e"
-ACCENT    = "#00ff88"
-FONT      = ("Consolas", 9)
-FONT_BOLD = ("Consolas", 9, "bold")
-FONT_TITLE= ("Consolas", 13, "bold")
-FONT_MONO = ("Consolas", 8)
+# ── palette ────────────────────────────────────────────────────────────────
+BG       = "#0f0f23"
+BG_ALT   = "#16162e"
+BG_SEL   = "#2a0a12"
+FG       = "#00ff88"
+FG_DIM   = "#4a7a63"
+FG_WARN  = "#ffb000"
+FG_CRIT  = "#ff2b4a"
+FG_BLOOD = "#c40d2e"
+FG_WHITE = "#d8f5e8"
+FG_CYAN  = "#7ad9ff"
+ACCENT   = "#00ff88"
+FONT       = ("Consolas", 9)
+FONT_BOLD  = ("Consolas", 9, "bold")
+FONT_TITLE = ("Consolas", 13, "bold")
+FONT_MONO  = ("Consolas", 8)
 
-HOME = Path(os.environ.get("LOCALAPPDATA", "")) / "hermes" / "sentinel"
-HOME.mkdir(parents=True, exist_ok=True)
-LOGFILE = HOME / "sentinel.log"
-CRASHLOG = HOME / "crash.log"
+CRASH = clog.HOME / "crash.log"
 
 
 def _crash(exc_type, exc_val, exc_tb):
-    """Unhandled exception -> crash.log. A windowed EXE has no console to complain to."""
     import traceback
     try:
-        with CRASHLOG.open("a", encoding="utf-8") as fh:
+        with CRASH.open("a", encoding="utf-8") as fh:
             fh.write(f"\n=== {datetime.now().isoformat()} ===\n")
             traceback.print_exception(exc_type, exc_val, exc_tb, file=fh)
     except OSError:
@@ -74,68 +65,27 @@ def _crash(exc_type, exc_val, exc_tb):
 
 sys.excepthook = _crash
 
-try:
-    with LOGFILE.open("a", encoding="utf-8") as _fh:
-        _fh.write(f"\n=== BOOT {datetime.now().isoformat()} pid={os.getpid()} ===\n")
-except OSError:
-    pass
-
-# Processes worth hunting. Anything else still shows in ALL mode.
-HUNTED = {
-    "powershell.exe", "pwsh.exe", "powershell_ise.exe",
-    "cmd.exe", "conhost.exe", "wt.exe", "windowsterminal.exe",
-    "python.exe", "pythonw.exe", "python3.exe",
-    "wsl.exe", "wslhost.exe", "wslrelay.exe", "wslservice.exe",
-    "node.exe", "npx.exe", "bun.exe", "deno.exe",
-    "bash.exe", "sh.exe", "ssh.exe", "git.exe", "git-bash.exe",
-    "msys2.exe", "mintty.exe",
-    "cscript.exe", "wscript.exe", "mshta.exe",
-    "docker.exe", "docker-compose.exe",
-    "ollama.exe", "llama-server.exe",
-    "ffmpeg.exe", "ffprobe.exe",
-    "java.exe", "javaw.exe",
+WIN_TAG = {
+    "NO-WINDOW": "supp",
+    "HIDDEN": "hidden",
+    "HIDDEN-UNTITLED": "hidden",
+    "VISIBLE-UNTITLED": "warn",
+    "VISIBLE": "vis",
 }
 
-# Sandbox / suppression tells — Windows header flags
-NO_WINDOW_STYLE = 0x08000000  # CREATE_NO_WINDOW
-
-user32 = ctypes.WinDLL("user32", use_last_error=True)
-kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-
-EnumWindows = user32.EnumWindows
-EnumWindowsProc = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
-
-
-def _owned_pids() -> dict[int, list[tuple[int, str, bool]]]:
-    """pid -> [(hwnd, title, visible), ...] for every top-level window."""
-    out: dict[int, list[tuple[int, str, bool]]] = defaultdict(list)
-
-    def cb(hwnd, _lp):
-        pid = wt.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if not pid.value:
-            return True
-        length = user32.GetWindowTextLengthW(hwnd)
-        buf = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, buf, length + 1)
-        vis = bool(user32.IsWindowVisible(hwnd))
-        out[pid.value].append((hwnd, buf.value, vis))
-        return True
-
-    EnumWindows(EnumWindowsProc(cb), 0)
-    return out
+KIND_COLORS = {
+    "BIRTH": FG,
+    "DEATH": FG_DIM,
+    "ESCALATE": FG_CRIT,
+    "CONNECT": FG_CYAN,
+    "KILL": FG_BLOOD,
+    "KILL-FAIL": FG_WARN,
+    "BOOT": ACCENT,
+    "NOTE": FG_DIM,
+}
 
 
-def _window_state(wins: list[tuple[int, str, bool]]) -> str:
-    if not wins:
-        return "SUPPRESSED"
-    if any(v for _h, _t, v in wins):
-        titled = [t for _h, t, v in wins if v and t.strip()]
-        return "VISIBLE" if titled else "VISIBLE*"
-    return "HIDDEN"
-
-
-def _fmt_bytes(b: float) -> str:
+def fmt_bytes(b: float) -> str:
     for unit in ("B", "K", "M", "G"):
         if b < 1024:
             return f"{b:0.0f}{unit}"
@@ -143,7 +93,7 @@ def _fmt_bytes(b: float) -> str:
     return f"{b:0.0f}T"
 
 
-def _fmt_age(sec: float) -> str:
+def fmt_age(sec: float) -> str:
     if sec < 3600:
         return f"{int(sec // 60)}m"
     if sec < 86400:
@@ -151,252 +101,156 @@ def _fmt_age(sec: float) -> str:
     return f"{sec / 86400:0.1f}d"
 
 
-def _short(s: str, n: int) -> str:
+def short(s: str, n: int) -> str:
     s = " ".join((s or "").split())
     return s if len(s) <= n else s[: n - 1] + "…"
-
-
-_PS_SNAPSHOT = r"""
-$ErrorActionPreference='SilentlyContinue'
-$procs = Get-CimInstance Win32_Process
-$win = @{}
-Get-Process | ForEach-Object {
-  if ($_.MainWindowHandle -ne 0) { $win[[int]$_.Id] = $_.MainWindowTitle }
-}
-$rows = foreach ($p in $procs) {
-  [PSCustomObject]@{
-    pid       = [int]$p.ProcessId
-    ppid      = [int]$p.ParentProcessId
-    name      = [string]$p.Name
-    cmdline   = [string]$p.CommandLine
-    ctime     = if ($p.CreationDate) { ([datetime]$p.CreationDate).ToUniversalTime().Subtract([datetime]'1970-01-01').TotalSeconds } else { 0 }
-    rss       = [int64]$p.WorkingSetSize
-    threads   = [int]$p.ThreadCount
-    vtitle    = [string]$win[[int]$p.ProcessId]
-  }
-}
-$rows | ConvertTo-Json -Compress -Depth 3
-"""
-
-
-def _bulk_processes() -> list[dict]:
-    """One PowerShell sweep for every process. psutil per-process attribute access
-    costs ~130s on a 1770-process box; this returns in well under a second."""
-    ps1 = HOME / "_snap.ps1"
-    try:
-        ps1.write_text(_PS_SNAPSHOT, encoding="utf-8")
-    except OSError:
-        pass
-    out = subprocess.run(
-        ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1)],
-        capture_output=True, text=True, timeout=60,
-        creationflags=0x08000000,  # CREATE_NO_WINDOW
-    )
-    raw = (out.stdout or "").strip()
-    if not raw:
-        return []
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
-    return data if isinstance(data, list) else [data]
-
-
-def _bulk_conns() -> dict[int, list[tuple[str, int, str, int]]]:
-    """One system-wide socket sweep, grouped by owning pid."""
-    grouped: dict[int, list[tuple[str, int, str, int]]] = defaultdict(list)
-    try:
-        for c in psutil.net_connections(kind="inet"):
-            if c.pid is None:
-                continue
-            if c.raddr:
-                grouped[c.pid].append(
-                    (c.raddr.ip, c.raddr.port, c.status, c.laddr.port if c.laddr else 0)
-                )
-            elif c.status == "LISTEN" and c.laddr:
-                grouped[c.pid].append(("", c.laddr.port, "LISTEN", c.laddr.port))
-    except (psutil.AccessDenied, OSError):
-        pass
-    return grouped
-
-
-_CPU_CACHE: dict[int, float] = {}
-_CPU_WALL: list[float] = [0.0]
-_TICK = os.cpu_count() or 8
-
-
-def snapshot() -> tuple[list[dict], dict[int, int]]:
-    """Full process + connection snapshot via bulk enumeration."""
-    conns_by_pid = _bulk_conns()
-    raw = _bulk_processes()
-
-    now = time.time()
-    prev_wall = _CPU_WALL[0]
-    dt = max(now - prev_wall, 0.001) if prev_wall else 0.0
-
-    rows: list[dict] = []
-    for r in raw:
-        try:
-            name = (r.get("name") or "").lower()
-            if name not in HUNTED:
-                continue
-            pid = int(r.get("pid") or 0)
-            if not pid:
-                continue
-            ctime = float(r.get("ctime") or 0.0)
-            age = now - ctime if ctime else 0.0
-            vtitle = (r.get("vtitle") or "").strip()
-            # A pid with a MainWindowHandle title is visible; otherwise it owns no window.
-            win_state = "VISIBLE" if vtitle else "SUPPRESSED"
-            mem = int(r.get("rss") or 0)
-
-            rows.append({
-                "pid": pid,
-                "ppid": int(r.get("ppid") or 0),
-                "name": r.get("name") or "?",
-                "user": "",
-                "cmdline": (r.get("cmdline") or "").strip(),
-                "age": age,
-                "rss": mem,
-                "conns": conns_by_pid.get(pid, []),
-                "win": win_state,
-                "wtitle": vtitle[:140],
-                "status": f"{r.get('threads') or 0}thr",
-                "cpu_t": 0.0,
-            })
-        except (KeyError, TypeError, ValueError):
-            continue
-
-    _CPU_WALL[0] = now
-
-    # Approximate CPU% from thread count and RSS is meaningless; report 0 and let the
-    # DETAIL pane show real values from a targeted per-pid lookup.
-    cpu_map = {r["pid"]: 0.0 for r in rows}
-    return rows, cpu_map
 
 
 class Sentinel(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("CARNAGE SENTINEL  ·  hidden-process hunter")
+        self.title("CARNAGE SENTINEL v1.1  ·  hidden process / window / connection hunter")
         self.configure(bg=BG)
-        self.geometry("1320x780")
-        self.minsize(980, 560)
+        self.geometry("1440x840")
+        self.minsize(1080, 620)
 
-        self._prev_cpu: dict[int, float] = {}
-        self._prev_wall = time.time()
         self._rows: list[dict] = []
-        self._net_rows: list[dict] = []
-        self._filter_hidden_only = tk.BooleanVar(value=False)
-        self._filter_text = tk.StringVar()
-        self._auto = tk.BooleanVar(value=True)
-        self._cpu_pct: dict[int, float] = {}
-        self._seen_pids: set[int] = set()
         self._lock = threading.Lock()
+        self._seen: dict[int, dict] = {}
+        self._seen_conns: dict[int, set] = {}
+        self._alerted: dict[int, int] = {}
+        self._events: list[dict] = []
+        self._filter_text = tk.StringVar()
+        self._filter_hidden = tk.BooleanVar(value=False)
+        self._filter_min_threat = tk.IntVar(value=0)
+        self._auto = tk.BooleanVar(value=True)
+        self._scanning = False
+        self._last_scan_s = 0.0
+
+        clog.record("BOOT", "sentinel v1.1 started",
+                    pid=os.getpid(), name="CarnageSentinel",
+                    session=detect.my_session(),
+                    detail=f"enumerating from session {detect.my_session()}")
 
         self._build_ui()
-        self.lbl_stat.config(text="BOOTING", fg=FG_WARN)
-        self.after(120, self._tick)
+        self._load_log()
+        self.after(100, self._tick)
 
-    # ── UI ─────────────────────────────────────────────────────────────────
+    # ── UI construction ────────────────────────────────────────────────────
     def _build_ui(self) -> None:
-        style = ttk.Style(self)
+        st = ttk.Style(self)
         try:
-            style.theme_use("clam")
+            st.theme_use("clam")
         except tk.TclError:
             pass
-        style.configure(".", background=BG, foreground=FG, fieldbackground=BG_ALT,
-                        bordercolor=ACCENT, font=FONT)
-        style.configure("Treeview", background=BG_ALT, foreground=FG,
-                        fieldbackground=BG_ALT, rowheight=19, font=FONT_MONO,
-                        borderwidth=0)
-        style.configure("Treeview.Heading", background=BG, foreground=ACCENT,
-                        font=FONT_BOLD, relief="flat")
-        style.map("Treeview", background=[("selected", BG_SEL)],
-                  foreground=[("selected", FG_CRIT)])
-        style.configure("TNotebook", background=BG, borderwidth=0)
-        style.configure("TNotebook.Tab", background=BG_ALT, foreground=FG_DIM,
-                        padding=(14, 5), font=FONT_BOLD)
-        style.map("TNotebook.Tab",
-                  background=[("selected", BG)],
-                  foreground=[("selected", ACCENT)])
-        style.configure("TCheckbutton", background=BG, foreground=FG, font=FONT)
-        style.map("TCheckbutton", background=[("active", BG)],
-                  foreground=[("active", ACCENT)])
+        st.configure(".", background=BG, foreground=FG, fieldbackground=BG_ALT, font=FONT)
+        st.configure("Treeview", background=BG_ALT, foreground=FG, fieldbackground=BG_ALT,
+                     rowheight=19, font=FONT_MONO, borderwidth=0)
+        st.configure("Treeview.Heading", background=BG, foreground=ACCENT,
+                     font=FONT_BOLD, relief="flat")
+        st.map("Treeview", background=[("selected", BG_SEL)],
+               foreground=[("selected", FG_CRIT)])
+        st.configure("TNotebook", background=BG, borderwidth=0)
+        st.configure("TNotebook.Tab", background=BG_ALT, foreground=FG_DIM,
+                     padding=(14, 5), font=FONT_BOLD)
+        st.map("TNotebook.Tab", background=[("selected", BG)],
+               foreground=[("selected", ACCENT)])
+        st.configure("TCheckbutton", background=BG, foreground=FG, font=FONT)
+        st.map("TCheckbutton", background=[("active", BG)],
+               foreground=[("active", ACCENT)])
+        st.configure("TScale", background=BG, troughcolor=BG_ALT)
 
-        # header
         head = tk.Frame(self, bg=BG)
         head.pack(fill="x", padx=10, pady=(8, 0))
         tk.Label(head, text="⟦ CARNAGE SENTINEL ⟧", bg=BG, fg=FG_CRIT,
                  font=FONT_TITLE).pack(side="left")
-        self.lbl_stat = tk.Label(head, text="SCANNING", bg=BG, fg=FG_DIM, font=FONT)
+        self.lbl_stat = tk.Label(head, text="BOOTING", bg=BG, fg=FG_WARN, font=FONT)
         self.lbl_stat.pack(side="left", padx=14)
+        self.lbl_session = tk.Label(head, text=f"session {detect.my_session()}",
+                                    bg=BG, fg=FG_DIM, font=FONT_MONO)
+        self.lbl_session.pack(side="right", padx=(0, 10))
         self.lbl_clock = tk.Label(head, text="", bg=BG, fg=FG_DIM, font=FONT_MONO)
-        self.lbl_clock.pack(side="right")
+        self.lbl_clock.pack(side="right", padx=10)
 
-        # control bar
         bar = tk.Frame(self, bg=BG)
         bar.pack(fill="x", padx=10, pady=6)
-        tk.Label(bar, text="FILTER:", bg=BG, fg=FG_DIM, font=FONT_BOLD).pack(side="left")
+        tk.Label(bar, text="FILTER", bg=BG, fg=FG_DIM, font=FONT_BOLD).pack(side="left")
         ent = tk.Entry(bar, textvariable=self._filter_text, bg=BG_ALT, fg=FG,
-                       insertbackground=FG, relief="flat", font=FONT, width=28)
-        ent.pack(side="left", padx=(6, 12))
-        ent.bind("<Return>", lambda _e: self._refresh())
-        self._filter_text.trace_add("write", lambda *_: self._refresh())
+                       insertbackground=FG, relief="flat", font=FONT, width=26)
+        ent.pack(side="left", padx=(6, 10))
+        self._filter_text.trace_add("write", lambda *_: self._on_filter())
 
-        ttk.Checkbutton(bar, text="HIDDEN/SUPPRESSED ONLY", variable=self._filter_hidden_only,
-                        command=self._refresh).pack(side="left", padx=(0, 12))
-        ttk.Checkbutton(bar, text="AUTO-SCAN 2s", variable=self._auto,
-                        command=self._tick).pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(bar, text="HIDDEN ONLY", variable=self._filter_hidden,
+                        command=self._refresh).pack(side="left", padx=(0, 8))
 
-        self._btn(bar, "⟳ RESCAN", self._refresh, ACCENT).pack(side="left", padx=4)
-        self._btn(bar, "✖ KILL PID", self._kill, FG_CRIT).pack(side="left", padx=4)
-        self._btn(bar, "⚡ COPY CMD", self._copy_cmd, FG_WARN).pack(side="left", padx=4)
+        tk.Label(bar, text="MIN THREAT", bg=BG, fg=FG_DIM, font=FONT_BOLD).pack(side="left", padx=(4, 0))
+        self._threat_lbl = tk.Label(bar, text="0", bg=BG, fg=FG_CRIT, font=FONT_BOLD, width=3)
+        self._threat_lbl.pack(side="left")
+        sc = ttk.Scale(bar, from_=0, to=100, orient="horizontal", length=110,
+                       command=self._on_threat)
+        sc.set(0)
+        sc.pack(side="left", padx=4)
+
+        ttk.Checkbutton(bar, text="AUTO 2s", variable=self._auto,
+                        command=self._tick).pack(side="left", padx=8)
+
+        self._btn(bar, "⟳ RESCAN", self._force_scan, ACCENT).pack(side="left", padx=3)
+        self._btn(bar, "✖ KILL", self._kill, FG_CRIT).pack(side="left", padx=3)
+        self._btn(bar, "⧉ CMD", self._copy_cmd, FG_WARN).pack(side="left", padx=3)
+        self._btn(bar, "⇩ EXPORT", self._export, FG_CYAN).pack(side="left", padx=3)
 
         self.lbl_count = tk.Label(bar, text="", bg=BG, fg=FG_DIM, font=FONT_MONO)
         self.lbl_count.pack(side="right")
 
-        # notebook
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=10, pady=(0, 4))
-        self.nb = nb
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, padx=10, pady=(0, 6))
 
-        self.tree = self._make_tree(nb, "HUNT", [
-            ("pid", 62), ("ppid", 62), ("name", 130), ("user", 90),
-            ("win", 105), ("cpu%", 62), ("ram", 68), ("age", 58),
-            ("net", 52), ("command", 620),
+        self.tree = self._mk_tree("HUNT", [
+            ("threat", 54), ("pid", 62), ("sess", 44), ("name", 128),
+            ("family", 68), ("win", 118), ("cpu", 50), ("ram", 62),
+            ("age", 52), ("conns", 50), ("user", 122), ("command", 540),
         ])
-        self._build_detail(nb, "HUNT")
-
-        self.net_tree = self._make_tree(nb, "NETWORK", [
-            ("pid", 62), ("process", 130), ("lport", 66), ("rip", 150),
-            ("rport", 66), ("state", 96), ("command", 560),
+        self.net_tree = self._mk_tree("NETWORK", [
+            ("threat", 54), ("pid", 62), ("process", 120), ("sess", 44),
+            ("lport", 62), ("remote", 148), ("rport", 62), ("state", 92),
+            ("command", 520),
         ])
-
-        self.tree_tree = self._make_tree(nb, "TREE", [
-            ("depth", 52), ("pid", 62), ("ppid", 62), ("name", 150),
-            ("win", 105), ("age", 58), ("command", 700),
+        self.tree_tree = self._mk_tree("TREE", [
+            ("depth", 56), ("pid", 62), ("ppid", 62), ("name", 140),
+            ("win", 118), ("sess", 44), ("threat", 54), ("command", 640),
         ])
+        self._build_log_tab()
+        self._build_detail_tab()
 
-        self.log = tk.Text(self, bg=BG_ALT, fg=FG_DIM, insertbackground=FG,
-                           font=FONT_MONO, relief="flat", wrap="none")
-        nb.add(self.log, text="  LOG  ")
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+
+    def _on_threat(self, val) -> None:
+        v = int(float(val))
+        self._threat_lbl.config(text=str(v))
+        self._filter_min_threat.set(v)
+        self._refresh()
+
+    def _on_filter(self) -> None:
+        self._refresh()
+        self._render_log()
 
     def _btn(self, parent, text, cmd, color):
-        b = tk.Button(parent, text=text, command=cmd, bg=BG_ALT, fg=color,
-                      activebackground=color, activeforeground=BG,
-                      relief="flat", font=FONT_BOLD, padx=10, pady=3,
-                      borderwidth=0, cursor="hand2")
-        return b
+        return tk.Button(parent, text=text, command=cmd, bg=BG_ALT, fg=color,
+                         activebackground=color, activeforeground=BG, relief="flat",
+                         font=FONT_BOLD, padx=9, pady=3, borderwidth=0, cursor="hand2")
 
-    def _make_tree(self, nb, label, cols):
-        frame = tk.Frame(nb, bg=BG)
-        nb.add(frame, text=f"  {label}  ")
+    def _mk_tree(self, label, cols):
+        frame = tk.Frame(self.nb, bg=BG)
+        self.nb.add(frame, text=f"  {label}  ")
+        return self._tree_in(frame, cols)
+
+    def _tree_in(self, frame, cols):
         names = [c[0] for c in cols]
         t = ttk.Treeview(frame, columns=names, show="headings", selectmode="browse")
         for name, width in cols:
             t.heading(name, text=name.upper())
-            t.column(name, width=width, anchor="w", stretch=(name == "command"))
+            t.column(name, width=width, anchor="w",
+                     stretch=(name in ("command", "remote", "message", "detail")))
         vs = ttk.Scrollbar(frame, orient="vertical", command=t.yview)
         hs = ttk.Scrollbar(frame, orient="horizontal", command=t.xview)
         t.configure(yscrollcommand=vs.set, xscrollcommand=hs.set)
@@ -408,12 +262,38 @@ class Sentinel(tk.Tk):
         t.tag_configure("supp", foreground=FG_CRIT)
         t.tag_configure("hidden", foreground=FG_WARN)
         t.tag_configure("vis", foreground=FG)
-        t.tag_configure("net", foreground="#7ad9ff")
+        t.tag_configure("warn", foreground=FG_WARN)
+        t.tag_configure("net", foreground=FG_CYAN)
+        for kind, color in KIND_COLORS.items():
+            t.tag_configure(kind, foreground=color)
         return t
 
-    def _build_detail(self, nb, _label) -> None:
-        frame = tk.Frame(nb, bg=BG)
-        nb.add(frame, text="  DETAIL  ")
+    def _build_log_tab(self) -> None:
+        frame = tk.Frame(self.nb, bg=BG)
+        self.nb.add(frame, text="  LOG  ")
+
+        ctl = tk.Frame(frame, bg=BG)
+        ctl.pack(fill="x", pady=(4, 2))
+        tk.Label(ctl, text="KIND", bg=BG, fg=FG_DIM, font=FONT_BOLD).pack(side="left")
+        self._log_kinds = {}
+        for kind in clog.KINDS:
+            v = tk.BooleanVar(value=True)
+            self._log_kinds[kind] = v
+            ttk.Checkbutton(ctl, text=kind, variable=v,
+                            command=self._render_log).pack(side="left", padx=(4, 0))
+        self._btn(ctl, "⟳ RELOAD", self._load_log, ACCENT).pack(side="right", padx=3)
+        self._btn(ctl, "⇩ SAVE", self._save_log, FG_CYAN).pack(side="right", padx=3)
+
+        wrap = tk.Frame(frame, bg=BG)
+        wrap.pack(fill="both", expand=True)
+        self._log_tree = self._tree_in(wrap, [
+            ("ts", 78), ("kind", 92), ("pid", 62), ("name", 132), ("win", 112),
+            ("sess", 44), ("threat", 54), ("message", 280), ("detail", 400),
+        ])
+
+    def _build_detail_tab(self) -> None:
+        frame = tk.Frame(self.nb, bg=BG)
+        self.nb.add(frame, text="  DETAIL  ")
         self.detail = tk.Text(frame, bg=BG_ALT, fg=FG, insertbackground=FG,
                               font=FONT_MONO, relief="flat", wrap="word",
                               padx=12, pady=10)
@@ -421,180 +301,286 @@ class Sentinel(tk.Tk):
         self.detail.configure(yscrollcommand=vs.set)
         self.detail.pack(side="left", fill="both", expand=True)
         vs.pack(side="right", fill="y")
-        self.detail.tag_configure("h", foreground=ACCENT, font=FONT_BOLD)
-        self.detail.tag_configure("crit", foreground=FG_CRIT)
-        self.detail.tag_configure("warn", foreground=FG_WARN)
-        self.detail.tag_configure("dim", foreground=FG_DIM)
-        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        for tag, color in (("h", ACCENT), ("crit", FG_CRIT), ("warn", FG_WARN),
+                           ("dim", FG_DIM), ("cyan", FG_CYAN), ("white", FG_WHITE)):
+            self.detail.tag_configure(tag, foreground=color,
+                                      font=FONT_BOLD if tag == "h" else FONT_MONO)
 
-    # ── data ───────────────────────────────────────────────────────────────
+    # ── scanning ───────────────────────────────────────────────────────────
+    def _force_scan(self) -> None:
+        if self._scanning:
+            return
+        self._scan()
+        self._refresh()
+
     def _scan(self) -> None:
-        rows, cpu_now = snapshot()
-        wall = time.time()
-        dt = max(wall - self._prev_wall, 0.001)
-        cpu_pct = {}
-        for r in rows:
-            prev = self._prev_cpu.get(r["pid"])
-            if prev is None:
-                cpu_pct[r["pid"]] = 0.0
-            else:
-                delta = max(r["cpu_t"] - prev, 0.0)
-                cpu_pct[r["pid"]] = min(100.0 * delta / dt, 999.0)
+        self._scanning = True
+        t0 = time.time()
+        try:
+            rows = detect.snapshot()
+        finally:
+            self._last_scan_s = time.time() - t0
+            self._scanning = False
+
         with self._lock:
-            self._prev_cpu = cpu_now
-            self._prev_wall = wall
+            prev_pids = set(self._seen)
+            prev_conn_sets = dict(self._seen_conns)
             self._rows = rows
-            self._cpu_pct = cpu_pct
 
-        new = {r["pid"] for r in rows} - self._seen_pids
-        gone = self._seen_pids - {r["pid"] for r in rows}
-        if self._seen_pids:
-            for r in rows:
-                if r["pid"] in new:
-                    self._log(f"BIRTH  pid={r['pid']} {r['name']} [{r['win']}] "
-                              f"{_short(r['cmdline'], 90)}")
-            for pid in gone:
-                self._log(f"DEATH  pid={pid}")
+        cur_pids = {r["pid"] for r in rows}
 
+        for r in rows:
+            if r["pid"] not in prev_pids and prev_pids:
+                clog.record("BIRTH", f"process appeared: {r['name']}",
+                            pid=r["pid"], ppid=r["ppid"], name=r["name"],
+                            win=r["win"], session=r["session"],
+                            threat=r["threat"], cmdline=r["cmdline"])
+
+        for pid in prev_pids - cur_pids:
+            old = self._seen.get(pid, {})
+            clog.record("DEATH", f"process gone: {old.get('name', '?')}",
+                        pid=pid, name=old.get("name", ""), win=old.get("win", ""),
+                        session=old.get("session"))
+
+        for r in rows:
+            prev_t = self._alerted.get(r["pid"])
+            if (prev_t is None or r["threat"] >= prev_t + 15) and r["threat"] >= 40:
+                self._alerted[r["pid"]] = r["threat"]
+                clog.record(
+                    "ESCALATE",
+                    f"threat {r['threat']}: {', '.join(r['reasons'][:4]) or 'pattern match'}",
+                    pid=r["pid"], name=r["name"], win=r["win"], session=r["session"],
+                    threat=r["threat"], cmdline=r["cmdline"],
+                    detail="; ".join(r["reasons"]),
+                )
+
+            sig = {(c[0], c[1], c[2]) for c in r["conns"]}
+            if sig:
+                before = prev_conn_sets.get(r["pid"], set())
+                fresh = sig - before
+                if fresh and prev_conn_sets:
+                    conn_list = [c for c in r["conns"] if (c[0], c[1], c[2]) in fresh]
+                    clog.record("CONNECT", f"{len(fresh)} new connection(s)",
+                                pid=r["pid"], name=r["name"], win=r["win"],
+                                session=r["session"], threat=r["threat"],
+                                conns=conn_list, cmdline=r["cmdline"])
+            self._seen_conns[r["pid"]] = sig
+
+        with self._lock:
+            self._seen = {r["pid"]: r for r in rows}
+
+        self._events = clog.read_events(4000)
+
+    # ── rendering ──────────────────────────────────────────────────────────
     def _match(self, r: dict) -> bool:
-        if self._filter_hidden_only.get() and r["win"] == "VISIBLE":
+        if self._filter_hidden.get() and r["win"] == "VISIBLE":
+            return False
+        if r["threat"] < self._filter_min_threat.get():
             return False
         q = self._filter_text.get().strip().lower()
         if not q:
             return True
-        hay = f"{r['name']} {r['cmdline']} {r['user']} {r['wtitle']}".lower()
+        hay = f"{r['name']} {r['cmdline']} {r['user']} {r['wtitle']} {r['win']} {r['family']}".lower()
         return q in hay
 
     def _refresh(self) -> None:
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
         with self._lock:
             rows = list(self._rows)
-            cpu = dict(self._cpu_pct)
-
         shown = [r for r in rows if self._match(r)]
-        shown.sort(key=lambda r: (r["win"] != "SUPPRESSED", r["win"] != "HIDDEN",
-                                  -cpu.get(r["pid"], 0.0)))
 
         self.tree.delete(*self.tree.get_children())
         for r in shown:
-            tag = ("supp" if r["win"] == "SUPPRESSED"
-                   else "hidden" if r["win"] == "HIDDEN" else "vis")
-            self.tree.insert("", "end", iid=str(r["pid"]), tags=(tag,), values=(
-                r["pid"], r["ppid"], r["name"], r["user"], r["win"],
-                f"{cpu.get(r['pid'], 0.0):0.1f}",
-                _fmt_bytes(r["rss"]), _fmt_age(r["age"]),
-                len(r["conns"]), _short(r["cmdline"], 300),
-            ))
+            self.tree.insert("", "end", iid=str(r["pid"]),
+                             tags=(WIN_TAG.get(r["win"], "vis"),), values=(
+                                 r["threat"], r["pid"], r["session"], r["name"],
+                                 r["family"], r["win"], f"{r['cpu']:0.1f}",
+                                 fmt_bytes(r["rss"]), fmt_age(r["age"]),
+                                 len(r["conns"]),
+                                 (r["user"] or "").split("\\")[-1][:18],
+                                 short(r["cmdline"], 260),
+                             ))
 
-        # network tab
         self.net_tree.delete(*self.net_tree.get_children())
         n = 0
         for r in shown:
             for rip, rport, state, lport in r["conns"]:
                 self.net_tree.insert("", "end", tags=("net",), values=(
-                    r["pid"], r["name"], lport or "", rip, rport or "",
-                    state, _short(r["cmdline"], 260),
+                    r["threat"], r["pid"], r["name"], r["session"], lport or "",
+                    rip or "-", rport or "", state, short(r["cmdline"], 220),
                 ))
                 n += 1
 
-        # tree tab
         self.tree_tree.delete(*self.tree_tree.get_children())
-        by_pid = {r["pid"]: r for r in rows}
         kids = defaultdict(list)
+        by_pid = {r["pid"]: r for r in rows}
         for r in rows:
             kids[r["ppid"]].append(r)
 
-        def emit(node: dict, depth: int, path: set[int]):
-            if node["pid"] in path:
+        def emit(node, depth, path):
+            if node["pid"] in path or depth > 8:
                 return
-            tag = ("supp" if node["win"] == "SUPPRESSED"
-                   else "hidden" if node["win"] == "HIDDEN" else "vis")
-            self.tree_tree.insert("", "end", tags=(tag,), values=(
-                "  " * depth + ("└─" if depth else "●"),
-                node["pid"], node["ppid"], node["name"], node["win"],
-                _fmt_age(node["age"]), _short(node["cmdline"], 320),
+            self.tree_tree.insert("", "end", tags=(WIN_TAG.get(node["win"], "vis"),), values=(
+                "  " * depth + ("└─" if depth else "●"), node["pid"], node["ppid"],
+                node["name"], node["win"], node["session"], node["threat"],
+                short(node["cmdline"], 300),
             ))
             for k in sorted(kids.get(node["pid"], []), key=lambda x: x["age"], reverse=True):
                 emit(k, depth + 1, path | {node["pid"]})
 
         roots = [r for r in rows if r["ppid"] not in by_pid]
-        for root in sorted(roots, key=lambda x: -x["age"])[:200]:
+        for root in sorted(roots, key=lambda x: -x["age"])[:250]:
             emit(root, 0, set())
 
-        hidden = sum(1 for r in rows if r["win"] != "VISIBLE")
+        hidden = sum(1 for r in rows if r["win"].startswith(("NO-WINDOW", "HIDDEN")))
+        hot = sum(1 for r in rows if r["threat"] >= 40)
         self.lbl_count.config(
-            text=f"tracked {len(rows)}  ·  hidden/suppressed {hidden}  ·  conns {n}"
-        )
+            text=f"rows {len(shown)}/{len(rows)}  ·  hidden {hidden}  ·  threat≥40 {hot}  ·  conns {n}  ·  scan {self._last_scan_s:0.2f}s")
         self.lbl_clock.config(text=datetime.now().strftime("%H:%M:%S"))
+        self._render_log()
 
-    def _on_select(self, _evt) -> None:
+    def _on_select(self, _evt=None) -> None:
         sel = self.tree.selection()
         if not sel:
             return
         pid = int(sel[0])
         with self._lock:
             row = next((r for r in self._rows if r["pid"] == pid), None)
-            cpu = self._cpu_pct.get(pid, 0.0)
         if not row:
             return
+
         d = self.detail
         d.configure(state="normal")
         d.delete("1.0", "end")
 
-        def put(label, val, tag=None):
-            d.insert("end", f"{label:<14}", "h")
-            d.insert("end", f"{val}\n", tag or ())
+        def put(label, val, tag="white"):
+            d.insert("end", f"{label:<16}", "h")
+            d.insert("end", f"{val}\n", tag)
 
-        put("PID", row["pid"])
-        put("PARENT", row["ppid"])
+        put("PID / PPID", f"{row['pid']}  ←  {row['ppid']}")
         put("NAME", row["name"])
-        put("OWNER", row["user"])
-        put("STATE", row["status"])
-        put("WINDOW", row["win"], "crit" if row["win"] == "SUPPRESSED" else "warn")
+        put("FAMILY", row["family"])
+        sess_note = f"{row['session']}"
+        if row["cross_session"]:
+            sess_note += "   (cross-session: window enumeration limited)"
+        put("SESSION", sess_note, "warn" if row["cross_session"] else "white")
+        put("OWNER", row["user"] or "(unknown)")
+        put("WINDOW", row["win"], "crit" if row["win"].startswith(("NO-WINDOW", "HIDDEN")) else "warn")
         if row["wtitle"]:
             put("TITLE", row["wtitle"])
-        put("CPU", f"{cpu:0.1f}%")
-        put("RAM", _fmt_bytes(row["rss"]))
-        put("AGE", _fmt_age(row["age"]))
-        put("CMD", row["cmdline"] or "(unavailable — elevated process)", None)
-        put("CWD", self._cwd(row["pid"]))
+        if row["wclasses"]:
+            put("CLASSES", ", ".join(row["wclasses"]))
+        put("HANDLES", row["handles"])
+        put("THREADS", row["threads"])
+        put("CPU", f"{row['cpu']:0.1f}%")
+        put("RAM", f"{fmt_bytes(row['rss'])}  (private {fmt_bytes(row['priv'])})")
+        put("AGE", fmt_age(row["age"]))
+        put("THREAT", f"{row['threat']}/100",
+            "crit" if row["threat"] >= 60 else "warn" if row["threat"] >= 30 else "white")
+
+        if row["reasons"]:
+            d.insert("end", "\nWHY THE SCORE\n", "h")
+            for reason in row["reasons"]:
+                d.insert("end", f"  ▸ {reason}\n",
+                         "crit" if row["threat"] >= 60 else "warn")
+
+        d.insert("end", "\nCOMMAND LINE\n", "h")
+        d.insert("end", (row["cmdline"] or "  (unavailable — elevated or protected process)") + "\n", "dim")
+
+        d.insert("end", "\nWORKING DIRECTORY\n", "h")
+        d.insert("end", f"  {detect.cwd_of(row['pid'])}\n", "dim")
 
         d.insert("end", "\nCONNECTIONS\n", "h")
         if not row["conns"]:
             d.insert("end", "  none\n", "dim")
         for rip, rport, state, lport in row["conns"]:
-            line = f"  {state:<12} local:{lport or '-'}"
+            line = f"  {state:<13} local:{lport or '-':<6}"
             if rip:
                 line += f"  →  {rip}:{rport}"
             d.insert("end", line + "\n",
                      "crit" if state == "ESTABLISHED" and rip else "dim")
 
         d.insert("end", "\nPARENT CHAIN\n", "h")
-        chain = []
-        cur = row["ppid"]
-        for _ in range(12):
-            if not cur:
-                break
-            try:
-                p = psutil.Process(cur)
-                chain.append(f"  {p.pid:>7}  {p.name():<24} {_short(' '.join(p.cmdline()), 80)}")
-                cur = p.ppid()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                chain.append(f"  {cur:>7}  (gone or access denied)")
-                break
-        d.insert("end", ("\n".join(chain) or "  none") + "\n", "dim")
-        d.configure(state="disabled")
+        chain = detect.parent_chain(row["pid"])
+        d.insert("end", ("\n".join("  " + c for c in chain) or "  none") + "\n", "dim")
 
-    @staticmethod
-    def _cwd(pid: int) -> str:
+        events = [e for e in self._events if e.get("pid") == pid][-15:]
+        if events:
+            d.insert("end", "\nRECENT EVENTS\n", "h")
+            for e in events:
+                d.insert("end", f"  {e.get('ts_short', '')}  {e.get('kind', ''):<10} {e.get('message', '')}\n", "dim")
+
+        d.configure(state="disabled")
+        self.nb.select(4)
+
+    # ── log tab ────────────────────────────────────────────────────────────
+    def _load_log(self) -> None:
+        self._events = clog.read_events(4000)
+        self._render_log()
+
+    def _render_log(self) -> None:
+        active = {k for k, v in self._log_kinds.items() if v.get()}
+        q = self._filter_text.get().strip().lower()
+        self._log_tree.delete(*self._log_tree.get_children())
+        for e in reversed(self._events):
+            kind = e.get("kind", "NOTE")
+            if kind not in active:
+                continue
+            if q:
+                hay = f"{e.get('name', '')} {e.get('message', '')} {e.get('cmdline', '')}".lower()
+                if q not in hay:
+                    continue
+            self._log_tree.insert("", "end", tags=(kind,), values=(
+                e.get("ts_short", ""), kind, e.get("pid") or "",
+                e.get("name", ""), e.get("win", ""), e.get("session") or "",
+                e.get("threat") or "", e.get("message", ""),
+                short(e.get("detail", ""), 300),
+            ))
+
+    def _save_log(self) -> None:
+        path = filedialog.asksaveasfilename(
+            defaultextension=".jsonl",
+            initialfile=f"sentinel-events-{datetime.now():%Y%m%d-%H%M%S}.jsonl",
+            filetypes=[("JSON Lines", "*.jsonl"), ("All files", "*.*")],
+        )
+        if not path:
+            return
         try:
-            return psutil.Process(pid).cwd()
-        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
-            return "(denied)"
+            with open(path, "w", encoding="utf-8") as fh:
+                for e in self._events:
+                    fh.write(json.dumps(e, ensure_ascii=False) + "\n")
+            self.lbl_stat.config(text=f"SAVED {len(self._events)} events", fg=ACCENT)
+        except OSError as exc:
+            self.lbl_stat.config(text="SAVE FAILED", fg=FG_CRIT)
+            clog.record("NOTE", f"log export failed: {exc}")
+
+    def _export(self) -> None:
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            initialfile=f"sentinel-snapshot-{datetime.now():%Y%m%d-%H%M%S}.json",
+            filetypes=[("JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        with self._lock:
+            rows = list(self._rows)
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(rows, fh, indent=1, default=str)
+            self.lbl_stat.config(text=f"EXPORTED {len(rows)}", fg=ACCENT)
+        except OSError as exc:
+            self.lbl_stat.config(text="EXPORT FAILED", fg=FG_CRIT)
+            clog.record("NOTE", f"snapshot export failed: {exc}")
 
     # ── actions ────────────────────────────────────────────────────────────
     def _kill(self) -> None:
         sel = self.tree.selection()
         if not sel:
+            self.lbl_stat.config(text="NO SELECTION", fg=FG_WARN)
             return
         pid = int(sel[0])
         with self._lock:
@@ -602,13 +588,18 @@ class Sentinel(tk.Tk):
         if not row:
             return
         try:
+            import psutil
             psutil.Process(pid).kill()
-            self._log(f"KILL   pid={pid} {row['name']} — TERMINATED")
-            self.lbl_stat.config(text=f"KILLED {pid}", fg=FG_CRIT)
-        except (psutil.NoSuchProcess, psutil.AccessDenied) as exc:
+            clog.record("KILL", f"terminated {row['name']}", pid=pid, name=row["name"],
+                        win=row["win"], session=row["session"], threat=row["threat"],
+                        cmdline=row["cmdline"])
+            self.lbl_stat.config(text=f"KILLED {pid}", fg=FG_BLOOD)
+        except Exception as exc:
+            clog.record("KILL-FAIL", f"kill denied: {exc}", pid=pid, name=row["name"],
+                        win=row["win"], session=row["session"])
             self.lbl_stat.config(text=f"KILL DENIED {pid}", fg=FG_WARN)
-            self._log(f"KILL-FAIL pid={pid} {exc}")
-        self.after(120, self._refresh)
+        self._events = clog.read_events(4000)
+        self.after(150, self._force_scan)
 
     def _copy_cmd(self) -> None:
         sel = self.tree.selection()
@@ -622,26 +613,21 @@ class Sentinel(tk.Tk):
             self.clipboard_append(row["cmdline"])
             self.lbl_stat.config(text="CMD COPIED", fg=ACCENT)
 
-    def _log(self, line: str) -> None:
-        stamp = datetime.now().strftime("%H:%M:%S")
-        entry = f"[{stamp}] {line}"
-        self.log.insert("end", entry + "\n")
-        self.log.see("end")
-        try:
-            with LOGFILE.open("a", encoding="utf-8") as fh:
-                fh.write(entry + "\n")
-        except OSError:
-            pass
-
     # ── loop ───────────────────────────────────────────────────────────────
     def _tick(self) -> None:
-        self._scan()
-        self._refresh()
+        try:
+            if not self.winfo_exists():
+                return
+        except tk.TclError:
+            return
         if self._auto.get():
+            self._scan()
+            self._refresh()
             self.lbl_stat.config(text="HUNTING", fg=ACCENT)
             self.after(2000, self._tick)
         else:
             self.lbl_stat.config(text="PAUSED", fg=FG_DIM)
+            self.after(500, self._tick)
 
 
 def main() -> int:
