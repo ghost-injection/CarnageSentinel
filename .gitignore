@@ -1,0 +1,13 @@
+# build artifacts
+build/
+build2/
+__pycache__/
+*.spec
+*.pyc
+
+# runtime logs (written to LOCALAPPDATA, never committed)
+sentinel.log
+crash.log
+
+# screenshots
+*_shot.png
